@@ -1,0 +1,142 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'backend/**'  # Only trigger on backend file changes
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      mongodb:
+        image: mongo:6
+        ports:
+          - 27017:27017
+          
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Use Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+        cache-dependency-path: 'backend/package-lock.json'
+    
+    - name: Install dependencies
+      working-directory: ./backend
+      run: npm ci
+      
+    - name: Run tests
+      working-directory: ./backend
+      run: npm test
+      env:
+        MONGODB_URI: mongodb://localhost:27017/test
+        
+    - name: Run linter
+      working-directory: ./backend
+      run: npm run lint
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Use Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.x'
+        cache: 'npm'
+        cache-dependency-path: 'backend/package-lock.json'
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Install dependencies
+      working-directory: ./backend
+      run: npm ci
+    
+    - name: Build
+      working-directory: ./backend
+      run: npm run build
+
+    - name: Setup SSH key
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+    - name: Create deployment package
+      working-directory: ./backend
+      run: |
+        tar -czf deploy.tar.gz \
+          --exclude='.git' \
+          --exclude='node_modules' \
+          --exclude='test' \
+          --exclude='*.log' \
+          .
+
+    - name: Deploy to EC2
+      env:
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+        EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+      run: |
+        # Copy deployment package
+        scp ./backend/deploy.tar.gz $EC2_USERNAME@$EC2_HOST:~/deploy.tar.gz
+        
+        # Execute deployment commands
+        ssh $EC2_USERNAME@$EC2_HOST << 'EOF'
+          # Stop existing application
+          pm2 stop invoizy-backend || true
+          
+          # Backup existing deployment if it exists
+          if [ -d "~/invoizy-backend" ]; then
+            mv ~/invoizy-backend ~/invoizy-backend-backup-$(date +%Y%m%d_%H%M%S)
+          fi
+          
+          # Create new deployment directory
+          mkdir -p ~/invoizy-backend
+          cd ~/invoizy-backend
+          
+          # Extract new deployment
+          tar -xzf ~/deploy.tar.gz
+          
+          # Install dependencies
+          npm ci --production
+          
+          # Copy environment file if it exists
+          if [ -f ~/invoizy-backend-backup-*/production.env ]; then
+            cp ~/invoizy-backend-backup-*/production.env .env
+          fi
+          
+          # Start application with PM2
+          pm2 start npm --name "invoizy-backend" -- start
+          
+          # Clean up
+          rm ~/deploy.tar.gz
+          
+          # Keep only last 3 backups
+          ls -dt ~/invoizy-backend-backup-* | tail -n +4 | xargs rm -rf
+        EOF
+
+    - name: Verify Deployment
+      env:
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+        EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+      run: |
+        ssh $EC2_USERNAME@$EC2_HOST "pm2 show invoizy-backend"
